@@ -761,12 +761,9 @@ def extract_answer(text):
 print("\n" + "=" * 60)
 print("3. AGIEVAL BENCHMARK")
 print("=" * 60)
-
 agieval_dataset = load_dataset(
-    "json",
-    data_files={
-        "train": "hf://datasets/ibm-aimc/AGIEval/multiple-choice/train-*"
-    },
+    "baber/agieval",
+    "multiple-choice",
     split="train",
 )
 
