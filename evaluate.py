@@ -763,8 +763,10 @@ print("3. AGIEVAL BENCHMARK")
 print("=" * 60)
 
 agieval_dataset = load_dataset(
-    "ibm-aimc/AGIEval",
-    "multiple-choice",
+    "json",
+    data_files={
+        "train": "hf://datasets/ibm-aimc/AGIEval/multiple-choice/train-*"
+    },
     split="train",
 )
 
