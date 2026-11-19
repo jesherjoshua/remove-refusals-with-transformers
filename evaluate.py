@@ -189,7 +189,6 @@ print("Modified layers:", len(model.model.layers))
 # ============================================================
 # TOKENIZATION HELPERS
 # ============================================================
-
 def encode_prompt(prompt):
 
     tokens = tokenizer.apply_chat_template(
@@ -202,7 +201,11 @@ def encode_prompt(prompt):
         add_generation_prompt=True,
         tokenize=True,
         return_tensors="pt",
+        return_dict=True,
     )
+
+    if isinstance(tokens, dict) or hasattr(tokens, "input_ids"):
+        tokens = tokens["input_ids"]
 
     return tokens.to(INPUT_DEVICE)
 
