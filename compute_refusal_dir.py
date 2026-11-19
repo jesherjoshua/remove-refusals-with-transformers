@@ -66,10 +66,9 @@ def generate(toks):
         toks = torch.tensor(toks)
 
     toks = toks.to(model.device)
-
-  print("INPUT TYPE:", type(toks))
-  print("INPUT CONTENT:", toks)
-  print("INPUT IDS TYPE:", type(toks["input_ids"]) if hasattr(toks, "keys") and "input_ids" in toks else "No input_ids")
+    print("INPUT TYPE:", type(toks))
+    print("INPUT CONTENT:", toks)
+    print("INPUT IDS TYPE:", type(toks["input_ids"]) if hasattr(toks, "keys") and "input_ids" in toks else "No input_ids")
 
     return model.generate(
         input_ids=toks,
