@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 torch.inference_mode()
 
-MODEL_ID = "tiiuae/Falcon3-1B-Instruct"
+MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
 # MODEL_ID = "Qwen/Qwen3-1.7B"
 # MODEL_ID = "stabilityai/stablelm-2-zephyr-1_6b"
 # MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat"
