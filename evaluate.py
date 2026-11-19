@@ -4,11 +4,12 @@ import re
 import json
 import csv
 import ast
+import string
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -29,9 +30,10 @@ REFUSAL_DIR_PATH = (
 
 OUTPUT_DIR = "abliteration_evaluation"
 
-# Set to an integer for a quick test, or None for the full split.
+# None = entire dataset.
+# Use small integers for initial testing.
 HARMFUL_LIMIT = 5 #None
-HARMLESS_KL_LIMIT = 5 # None
+HARMLESS_KL_LIMIT =5 #None
 AGIEVAL_LIMIT = 5 #None
 
 HARMFUL_MAX_NEW_TOKENS = 128
@@ -39,17 +41,32 @@ AGIEVAL_MAX_NEW_TOKENS = 128
 
 DEVICE = "cuda"
 
+# AGIEval repository configurations.
+AGIEVAL_CONFIGS = [
+    "aqua-rat",
+    "logiqa-en",
+    "lsat-ar",
+    "lsat-lr",
+    "lsat-rc",
+    "sat-en",
+    "sat-en-without-passage",
+    "sat-math",
+]
+
+AGIEVAL_SPLIT = "test"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Global switch used by the inserted ablation modules.
 ABLATION_ENABLED = False
 
 
 # ============================================================
-# 2. LOAD MODEL AND TOKENIZER
+# 2. LOAD MODEL
 # ============================================================
 
-print("Loading model...")
+print("=" * 60)
+print("LOADING MODEL")
+print("=" * 60)
 
 quantization_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -88,7 +105,7 @@ print("\nLoading refusal direction...")
 
 if not os.path.exists(REFUSAL_DIR_PATH):
     raise FileNotFoundError(
-        f"Could not find refusal direction file: {REFUSAL_DIR_PATH}"
+        f"Refusal direction not found: {REFUSAL_DIR_PATH}"
     )
 
 refusal_dir = torch.load(
@@ -101,13 +118,13 @@ refusal_dir = refusal_dir.float().squeeze()
 
 if refusal_dir.ndim != 1:
     raise ValueError(
-        f"Expected a 1D refusal direction, got shape {refusal_dir.shape}"
+        f"Expected a 1D refusal direction, got {refusal_dir.shape}"
     )
 
 if refusal_dir.numel() != model.config.hidden_size:
     raise ValueError(
-        f"Refusal direction dimension is {refusal_dir.numel()}, "
-        f"but model hidden size is {model.config.hidden_size}."
+        f"Direction dimension {refusal_dir.numel()} does not match "
+        f"model hidden size {model.config.hidden_size}."
     )
 
 refusal_dir = F.normalize(refusal_dir, dim=0)
@@ -120,12 +137,6 @@ print("Refusal direction loaded:", refusal_dir.shape)
 # ============================================================
 
 class AblationDecoderLayer(nn.Module):
-    """
-    Removes the component of hidden_states parallel to refusal_dir.
-
-    This module returns a Tensor directly because Qwen3's decoder
-    loop expects each entry in model.model.layers to return a Tensor.
-    """
 
     def __init__(self):
         super().__init__()
@@ -153,27 +164,27 @@ class AblationDecoderLayer(nn.Module):
 # 5. INSERT ABLATION MODULES
 # ============================================================
 
-print("\nInstalling ablation layers...")
+print("\nInstalling ablation modules...")
 
 layers = model.model.layers
 original_layer_count = len(layers)
 
-# Insert one ablation operation after every original block.
 for idx in reversed(range(original_layer_count)):
+
     layers.insert(
         idx + 1,
         AblationDecoderLayer(),
     )
 
-# Do NOT double model.config.num_hidden_layers.
-# These inserted modules are not actual Qwen3 decoder blocks.
+# Do not change model.config.num_hidden_layers.
+# The inserted modules are not transformer decoder blocks.
 
 print("Original transformer layers:", original_layer_count)
-print("Layers including ablation modules:", len(model.model.layers))
+print("Layers after insertion:", len(model.model.layers))
 
 
 # ============================================================
-# 6. TOKENIZATION HELPERS
+# 6. TOKENIZATION
 # ============================================================
 
 def encode_prompt(prompt):
@@ -191,7 +202,6 @@ def encode_prompt(prompt):
         return_dict=True,
     )
 
-    # Handle both Tensor and BatchEncoding return formats.
     if isinstance(encoded, torch.Tensor):
         tokens = encoded
 
@@ -203,14 +213,14 @@ def encode_prompt(prompt):
 
     else:
         raise TypeError(
-            f"Unexpected tokenizer output type: {type(encoded)}"
+            f"Unexpected tokenizer output: {type(encoded)}"
         )
 
     return tokens.to(INPUT_DEVICE)
 
 
 # ============================================================
-# 7. GENERATION FUNCTION
+# 7. GENERATION
 # ============================================================
 
 @torch.inference_mode()
@@ -239,16 +249,14 @@ def generate_response(prompt, max_new_tokens=128):
 
     response_tokens = output[0, tokens.shape[1]:]
 
-    response = tokenizer.decode(
+    return tokenizer.decode(
         response_tokens,
         skip_special_tokens=True,
-    )
-
-    return response.strip()
+    ).strip()
 
 
 # ============================================================
-# 8. NEXT-TOKEN LOGITS FOR KL DIVERGENCE
+# 8. NEXT-TOKEN LOGITS
 # ============================================================
 
 @torch.inference_mode()
@@ -272,62 +280,11 @@ def get_next_token_logits(prompt, ablated):
         return_dict=True,
     )
 
-    # Distribution for the first token generated after the prompt.
     return output.logits[0, -1, :].float()
 
 
 # ============================================================
-# 9. MODEL SANITY CHECK
-# ============================================================
-
-print("\n" + "=" * 60)
-print("MODEL SANITY CHECK")
-print("=" * 60)
-
-test_prompt = "Hello, how are you?"
-
-baseline_logits = get_next_token_logits(
-    test_prompt,
-    ablated=False,
-)
-
-ablated_logits = get_next_token_logits(
-    test_prompt,
-    ablated=True,
-)
-
-if baseline_logits.shape != ablated_logits.shape:
-    raise RuntimeError(
-        "Baseline and ablated logits have different shapes."
-    )
-
-mean_logit_difference = (
-    baseline_logits - ablated_logits
-).abs().mean().item()
-
-print("Logit shape:", baseline_logits.shape)
-print("Mean absolute logit difference:", mean_logit_difference)
-
-if mean_logit_difference == 0:
-    print(
-        "WARNING: Ablation produced no measurable logit change. "
-        "Check the refusal direction and layer insertion."
-    )
-else:
-    print("Ablation is producing a measurable change.")
-
-del baseline_logits
-del ablated_logits
-
-torch.cuda.empty_cache()
-
-ABLATION_ENABLED = False
-
-print("Sanity check completed.")
-
-
-# ============================================================
-# 10. DATASET HELPERS
+# 9. GENERAL DATASET HELPERS
 # ============================================================
 
 def limit_dataset(dataset, limit):
@@ -343,6 +300,7 @@ def limit_dataset(dataset, limit):
 def first_available(example, keys):
 
     for key in keys:
+
         value = example.get(key)
 
         if value is not None and str(value).strip():
@@ -353,36 +311,83 @@ def first_available(example, keys):
 
 def get_text_prompt(example):
 
-    """
-    Extract a text prompt from common dataset column names.
-    Supports Alpaca-style instruction/input examples too.
-    """
-
     instruction = first_available(
         example,
-        ["instruction", "prompt", "text", "question", "query"],
+        [
+            "instruction",
+            "prompt",
+            "text",
+            "question",
+            "query",
+        ],
     )
 
     additional_input = first_available(
         example,
-        ["input", "context"],
+        [
+            "input",
+            "context",
+        ],
     )
 
-    if instruction is not None:
+    if instruction is None:
+        raise KeyError(
+            f"Cannot find prompt field. "
+            f"Available columns: {list(example.keys())}"
+        )
 
-        if additional_input is not None:
-            return (
-                str(instruction)
-                + "\n\n"
-                + str(additional_input)
-            )
+    if additional_input is not None:
 
-        return str(instruction)
+        return (
+            str(instruction)
+            + "\n\n"
+            + str(additional_input)
+        )
 
-    raise KeyError(
-        "Could not identify a prompt column. "
-        f"Available columns: {list(example.keys())}"
-    )
+    return str(instruction)
+
+
+# ============================================================
+# 10. SANITY CHECK
+# ============================================================
+
+print("\n" + "=" * 60)
+print("ABLATION SANITY CHECK")
+print("=" * 60)
+
+test_prompt = "Hello, how are you?"
+
+baseline_logits = get_next_token_logits(
+    test_prompt,
+    ablated=False,
+)
+
+ablated_logits = get_next_token_logits(
+    test_prompt,
+    ablated=True,
+)
+
+if baseline_logits.shape != ablated_logits.shape:
+    raise RuntimeError("Baseline and ablated shapes differ.")
+
+logit_difference = (
+    baseline_logits - ablated_logits
+).abs().mean().item()
+
+print("Logit shape:", baseline_logits.shape)
+print("Mean absolute logit difference:", logit_difference)
+
+if logit_difference == 0:
+    print("WARNING: Ablation produced no measurable change.")
+else:
+    print("Ablation produced a measurable change.")
+
+del baseline_logits
+del ablated_logits
+
+torch.cuda.empty_cache()
+
+ABLATION_ENABLED = False
 
 
 # ============================================================
@@ -398,8 +403,8 @@ harmful_dataset = load_dataset(
     split="test",
 )
 
-print("Harmful dataset columns:", harmful_dataset.column_names)
-print("Harmful dataset size:", len(harmful_dataset))
+print("Harmful columns:", harmful_dataset.column_names)
+print("Harmful examples:", len(harmful_dataset))
 
 harmful_dataset = limit_dataset(
     harmful_dataset,
@@ -469,14 +474,14 @@ refusal_rate = (
     if harmful_count else 0.0
 )
 
-print("\nHarmful evaluation complete.")
+print("\nHarmful evaluation finished.")
 print("Total prompts:", harmful_count)
 print("Detected refusals:", refusal_count)
 print(f"Refusal rate: {refusal_rate * 100:.2f}%")
 
 
 # ============================================================
-# 12. HARMLESS ALPACA FIRST-TOKEN KL DIVERGENCE
+# 12. HARMLESS ALPACA KL DIVERGENCE
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -488,8 +493,8 @@ harmless_dataset = load_dataset(
     split="test",
 )
 
-print("Harmless dataset columns:", harmless_dataset.column_names)
-print("Harmless dataset size:", len(harmless_dataset))
+print("Harmless columns:", harmless_dataset.column_names)
+print("Harmless examples:", len(harmless_dataset))
 
 harmless_dataset = limit_dataset(
     harmless_dataset,
@@ -505,19 +510,18 @@ for example in tqdm(
 
     prompt = get_text_prompt(example)
 
-    # Original model distribution.
     original_logits = get_next_token_logits(
         prompt,
         ablated=False,
     )
 
-    # Ablated model distribution.
     ablated_logits = get_next_token_logits(
         prompt,
         ablated=True,
     )
 
-    # KL(P_original || P_ablated).
+    # KL(P_original || P_ablated)
+
     log_p = F.log_softmax(
         original_logits,
         dim=-1,
@@ -542,9 +546,6 @@ for example in tqdm(
     del log_q
     del p
 
-    if len(kl_values) % 100 == 0:
-        torch.cuda.empty_cache()
-
 
 kl_tensor = torch.tensor(
     kl_values,
@@ -566,15 +567,78 @@ std_kl = (
     if len(kl_tensor) > 1 else 0.0
 )
 
-print("\nKL evaluation complete.")
+print("\nKL evaluation finished.")
 print("Number of prompts:", len(kl_values))
-print(f"Mean KL divergence: {mean_kl:.6f} nats")
-print(f"Median KL divergence: {median_kl:.6f} nats")
+print(f"Mean KL: {mean_kl:.6f} nats")
+print(f"Median KL: {median_kl:.6f} nats")
 print(f"Standard deviation: {std_kl:.6f}")
 
 
 # ============================================================
-# 13. AGIEVAL HELPERS
+# 13. AGIEVAL DATASET LOADING
+# ============================================================
+
+print("\n" + "=" * 60)
+print("3. LOADING RUCAIBOX AGIEVAL")
+print("=" * 60)
+
+agi_datasets = []
+
+for config_name in AGIEVAL_CONFIGS:
+
+    print(f"\nLoading: {config_name}")
+
+    try:
+
+        ds = load_dataset(
+            "RUCAIBox/agieval",
+            config_name,
+            split=AGIEVAL_SPLIT,
+        )
+
+        # Keep the subject name for grouped results.
+        ds = ds.map(
+            lambda example, name=config_name: {
+                "subject": name
+            }
+        )
+
+        print("Examples:", len(ds))
+        print("Columns:", ds.column_names)
+
+        if len(ds) > 0:
+            print("Example:", ds[0])
+
+        agi_datasets.append(ds)
+
+    except Exception as exc:
+
+        print(
+            f"WARNING: Could not load {config_name}: {exc}"
+        )
+
+
+if not agi_datasets:
+    raise RuntimeError(
+        "No AGIEval configurations could be loaded."
+    )
+
+agieval_dataset = concatenate_datasets(
+    agi_datasets
+)
+
+print("\nCombined AGIEval examples:", len(agieval_dataset))
+
+agieval_dataset = limit_dataset(
+    agieval_dataset,
+    AGIEVAL_LIMIT,
+)
+
+print("Examples selected for evaluation:", len(agieval_dataset))
+
+
+# ============================================================
+# 14. AGIEVAL PROMPT CONSTRUCTION
 # ============================================================
 
 def parse_options(raw_options):
@@ -583,12 +647,14 @@ def parse_options(raw_options):
         return []
 
     if isinstance(raw_options, dict):
+
         return [
             f"{key}. {value}"
             for key, value in raw_options.items()
         ]
 
     if isinstance(raw_options, (list, tuple)):
+
         return [
             str(option)
             for option in raw_options
@@ -598,8 +664,8 @@ def parse_options(raw_options):
 
         stripped = raw_options.strip()
 
-        # Try parsing a string representation of a list/dict.
         try:
+
             parsed = ast.literal_eval(stripped)
 
             if isinstance(parsed, (list, tuple, dict)):
@@ -613,49 +679,66 @@ def parse_options(raw_options):
     return [str(raw_options)]
 
 
-def get_agieval_prompt(example):
+def build_agieval_prompt(example):
+
+    # Some mirrors expose a complete prompt.
+    existing_prompt = example.get("prompt")
+
+    if existing_prompt is not None:
+        return str(existing_prompt)
+
+    passage = first_available(
+        example,
+        [
+            "passage",
+            "context",
+        ],
+    )
 
     question = first_available(
         example,
-        ["prompt", "question", "query", "input"],
+        [
+            "question",
+            "query",
+            "input",
+        ],
     )
 
     if question is None:
         raise KeyError(
-            "Could not find an AGIEval question field. "
-            f"Available columns: {list(example.keys())}"
+            f"Cannot find AGIEval question field. "
+            f"Columns: {list(example.keys())}"
         )
 
-    passage = first_available(
-        example,
-        ["passage", "context"],
-    )
-
-    options = first_available(
-        example,
-        ["options", "choices", "candidates"],
-    )
-
-    prompt_parts = []
+    parts = []
 
     if passage is not None:
-        prompt_parts.append(
+        parts.append(
             "Passage:\n" + str(passage)
         )
 
-    prompt_parts.append(
+    parts.append(
         "Question:\n" + str(question)
     )
 
-    parsed_options = parse_options(options)
+    raw_options = first_available(
+        example,
+        [
+            "options",
+            "choices",
+            "candidates",
+        ],
+    )
 
-    if parsed_options:
+    options = parse_options(raw_options)
+
+    if options:
 
         labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
         formatted_options = []
 
-        for index, option in enumerate(parsed_options):
+        for index, option in enumerate(options):
 
             if index < len(labels):
                 label = labels[index]
@@ -666,37 +749,48 @@ def get_agieval_prompt(example):
                 f"{label}. {option}"
             )
 
-        prompt_parts.append(
-            "Options:\n" + "\n".join(formatted_options)
+        parts.append(
+            "Options:\n"
+            + "\n".join(formatted_options)
         )
 
-        prompt_parts.append(
-            "Choose the correct option. "
-            "Give the answer as a single option letter."
+        parts.append(
+            "Select the correct option. "
+            "Respond with the option letter and no explanation."
         )
 
-    return "\n\n".join(prompt_parts)
+    else:
+
+        parts.append(
+            "Solve the question. "
+            "Give your final answer clearly."
+        )
+
+    return "\n\n".join(parts)
 
 
-def normalize_gold(answer, options=None):
+# ============================================================
+# 15. AGIEVAL ANSWER NORMALIZATION
+# ============================================================
+
+def normalize_agieval_gold(answer):
 
     if answer is None:
         return None
 
-    # Numeric answer indices are sometimes used in MC datasets.
-    if isinstance(answer, int):
+    if isinstance(answer, list):
 
-        if options is not None:
-            parsed_options = parse_options(options)
-
-            if 0 <= answer < len(parsed_options):
-                return chr(ord("A") + answer)
-
-        return None
+        if len(answer) == 1:
+            answer = answer[0]
+        else:
+            return [
+                normalize_agieval_gold(x)
+                for x in answer
+            ]
 
     answer = str(answer).strip()
 
-    # Direct letter answer.
+    # Direct multiple-choice letter.
     match = re.fullmatch(
         r"\(?\s*([A-E])\s*\)?[.)]?",
         answer,
@@ -706,9 +800,9 @@ def normalize_gold(answer, options=None):
     if match:
         return match.group(1).upper()
 
-    # Answer embedded in a longer string.
+    # Explicit answer statement.
     match = re.search(
-        r"(?:answer|option|correct answer)\s*(?:is|:)?\s*\(?([A-E])\)?",
+        r"(?:answer|option)\s*(?:is|:)?\s*\(?([A-E])\)?",
         answer,
         re.IGNORECASE,
     )
@@ -716,65 +810,144 @@ def normalize_gold(answer, options=None):
     if match:
         return match.group(1).upper()
 
-    # Numeric string index.
-    if answer.isdigit() and options is not None:
-
-        index = int(answer)
-        parsed_options = parse_options(options)
-
-        if 0 <= index < len(parsed_options):
-            return chr(ord("A") + index)
-
-    return None
+    return normalize_text(answer)
 
 
-def extract_answer(text):
+def normalize_text(text):
 
-    text = text.strip()
+    text = str(text).strip().lower()
 
-    # Prefer explicit answer statements.
-    patterns = [
-        r"(?:final answer|correct answer|answer|option)"
-        r"\s*(?:is|:)?\s*\(?([A-E])\)?",
+    text = text.replace(",", "")
+    text = text.replace("$", "")
+    text = text.replace("%", "")
 
-        r"^\s*\(?([A-E])\)?(?:[.)\s]|$)",
+    text = re.sub(
+        r"\s+",
+        "",
+        text,
+    )
+
+    text = text.strip(string.punctuation)
+
+    return text
+
+
+def extract_agieval_prediction(response, is_multiple_choice):
+
+    response = response.strip()
+
+    if is_multiple_choice:
+
+        patterns = [
+            r"(?:final answer|correct answer|answer|option)"
+            r"\s*(?:is|:)?\s*\(?([A-E])\)?",
+
+            r"^\s*\(?([A-E])\)?(?:[.)\s]|$)",
+        ]
+
+        for pattern in patterns:
+
+            matches = re.findall(
+                pattern,
+                response,
+                re.IGNORECASE,
+            )
+
+            if matches:
+                return matches[-1].upper()
+
+        # Try a standalone letter on the last nonempty line.
+        lines = [
+            line.strip()
+            for line in response.splitlines()
+            if line.strip()
+        ]
+
+        if lines:
+
+            match = re.fullmatch(
+                r"\(?([A-E])\)?[.)]?",
+                lines[-1],
+                re.IGNORECASE,
+            )
+
+            if match:
+                return match.group(1).upper()
+
+        return None
+
+    # Free-response tasks: use the last nonempty line.
+    lines = [
+        line.strip()
+        for line in response.splitlines()
+        if line.strip()
     ]
 
-    for pattern in patterns:
+    if not lines:
+        return None
 
-        matches = re.findall(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
+    final_line = lines[-1]
 
-        if matches:
-            return matches[-1].upper()
+    final_line = re.sub(
+        r"^(final answer|answer)\s*:\s*",
+        "",
+        final_line,
+        flags=re.IGNORECASE,
+    )
 
-    return None
+    return normalize_text(final_line)
+
+
+def get_agieval_gold(example):
+
+    return first_available(
+        example,
+        [
+            "label",
+            "answer",
+            "gold",
+            "target",
+        ],
+    )
+
+
+def is_multiple_choice(example):
+
+    options = first_available(
+        example,
+        [
+            "options",
+            "choices",
+            "candidates",
+        ],
+    )
+
+    return options is not None
+
+
+def score_agieval(prediction, gold, multiple_choice):
+
+    if prediction is None or gold is None:
+        return False
+
+    normalized_gold = normalize_agieval_gold(gold)
+
+    if isinstance(normalized_gold, list):
+        return prediction in normalized_gold
+
+    if multiple_choice:
+        return prediction == normalized_gold
+
+    return normalize_text(prediction) == normalized_gold
 
 
 # ============================================================
-# 14. AGIEVAL MULTIPLE-CHOICE BENCHMARK
+# 16. RUN AGIEVAL
 # ============================================================
 
 print("\n" + "=" * 60)
-print("3. AGIEVAL BENCHMARK")
+print("RUNNING AGIEVAL")
 print("=" * 60)
-agieval_dataset = load_dataset(
-    "baber/agieval",
-    "multiple-choice",
-    split="train",
-)
-
-print("AGIEval columns:", agieval_dataset.column_names)
-print("AGIEval dataset size:", len(agieval_dataset))
-print("First AGIEval example:", agieval_dataset[0])
-
-agieval_dataset = limit_dataset(
-    agieval_dataset,
-    AGIEVAL_LIMIT,
-)
 
 correct_count = 0
 valid_count = 0
@@ -788,40 +961,26 @@ for example in tqdm(
     desc="AGIEval",
 ):
 
-    prompt = get_agieval_prompt(example)
+    prompt = build_agieval_prompt(example)
 
-    raw_gold = first_available(
-        example,
-        [
-            "answer",
-            "label",
-            "correct",
-            "answerKey",
-            "target",
-        ],
-    )
+    gold = get_agieval_gold(example)
 
-    options = first_available(
-        example,
-        ["options", "choices", "candidates"],
-    )
-
-    gold = normalize_gold(
-        raw_gold,
-        options,
-    )
+    multiple_choice = is_multiple_choice(example)
 
     response = generate_response(
         prompt,
         AGIEVAL_MAX_NEW_TOKENS,
     )
 
-    prediction = extract_answer(response)
+    prediction = extract_agieval_prediction(
+        response,
+        multiple_choice,
+    )
 
-    correct = (
-        prediction is not None
-        and gold is not None
-        and prediction == gold
+    correct = score_agieval(
+        prediction,
+        gold,
+        multiple_choice,
     )
 
     if prediction is not None and gold is not None:
@@ -830,17 +989,13 @@ for example in tqdm(
     if correct:
         correct_count += 1
 
-    subject = first_available(
-        example,
-        ["subject", "category", "task", "source"],
+    subject = example.get(
+        "subject",
+        "unknown",
     )
 
-    if subject is None:
-        subject = "unknown"
-
-    subject = str(subject)
-
     if subject not in subject_scores:
+
         subject_scores[subject] = {
             "correct": 0,
             "total": 0,
@@ -853,9 +1008,10 @@ for example in tqdm(
 
     agi_predictions.append({
         "subject": subject,
-        "gold": gold,
-        "prediction": prediction,
+        "gold": str(gold),
+        "prediction": str(prediction),
         "correct": correct,
+        "multiple_choice": multiple_choice,
         "response": response,
         "prompt": prompt,
     })
@@ -871,18 +1027,36 @@ agi_valid_rate = (
     if agi_total else 0.0
 )
 
-print("\nAGIEval complete.")
+print("\nAGIEval finished.")
 print("Total questions:", agi_total)
-print("Correct answers:", correct_count)
+print("Correct:", correct_count)
 print(f"Accuracy: {agi_accuracy * 100:.2f}%")
 print(f"Valid answer rate: {agi_valid_rate * 100:.2f}%")
 
+print("\nSubject-level results:")
+
+for subject, scores in subject_scores.items():
+
+    accuracy = (
+        scores["correct"] / scores["total"]
+        if scores["total"] else 0.0
+    )
+
+    print(
+        f"{subject}: "
+        f"{scores['correct']}/{scores['total']} "
+        f"({accuracy * 100:.2f}%)"
+    )
+
 
 # ============================================================
-# 15. SAVE RESULTS
+# 17. SAVE RESULTS
 # ============================================================
+
+print("\nSaving evaluation results...")
 
 results = {
+
     "model": MODEL_ID,
 
     "ablation": {
@@ -911,9 +1085,9 @@ results = {
     },
 
     "agieval": {
-        "dataset": "ibm-aimc/AGIEval",
-        "config": "multiple-choice",
-        "split": "train",
+        "dataset": "RUCAIBox/agieval",
+        "split": AGIEVAL_SPLIT,
+        "configs": AGIEVAL_CONFIGS,
         "total": agi_total,
         "correct": correct_count,
         "accuracy": agi_accuracy,
@@ -928,7 +1102,12 @@ results_path = os.path.join(
     "evaluation_results.json",
 )
 
-with open(results_path, "w", encoding="utf-8") as f:
+with open(
+    results_path,
+    "w",
+    encoding="utf-8",
+) as f:
+
     json.dump(
         results,
         f,
@@ -937,7 +1116,7 @@ with open(results_path, "w", encoding="utf-8") as f:
     )
 
 
-# Save AGIEval predictions.
+# AGIEval predictions.
 predictions_path = os.path.join(
     OUTPUT_DIR,
     "agieval_predictions.csv",
@@ -957,6 +1136,7 @@ with open(
             "gold",
             "prediction",
             "correct",
+            "multiple_choice",
             "response",
             "prompt",
         ],
@@ -966,33 +1146,47 @@ with open(
     writer.writerows(agi_predictions)
 
 
-# Save harmless KL values.
+# KL values.
 kl_path = os.path.join(
     OUTPUT_DIR,
     "harmless_kl_values.json",
 )
 
-with open(kl_path, "w", encoding="utf-8") as f:
-    json.dump(kl_values, f)
+with open(
+    kl_path,
+    "w",
+    encoding="utf-8",
+) as f:
+
+    json.dump(
+        kl_values,
+        f,
+        indent=4,
+    )
 
 
-# Save harmful prompt predictions.
+# Harmful predictions.
 harmful_path = os.path.join(
     OUTPUT_DIR,
     "harmful_predictions.json",
 )
 
-with open(harmful_path, "w", encoding="utf-8") as f:
+with open(
+    harmful_path,
+    "w",
+    encoding="utf-8",
+) as f:
+
     json.dump(
         harmful_predictions,
         f,
-        indent=2,
+        indent=4,
         ensure_ascii=False,
     )
 
 
 # ============================================================
-# 16. FINAL SUMMARY
+# 18. FINAL SUMMARY
 # ============================================================
 
 ABLATION_ENABLED = False
@@ -1007,4 +1201,11 @@ print("KL values:", kl_path)
 print("Harmful predictions:", harmful_path)
 
 print("\nFINAL RESULTS")
-print(json.dumps(results, indent=4, ensure_ascii=False))
+
+print(
+    json.dumps(
+        results,
+        indent=4,
+        ensure_ascii=False,
+    )
+)
