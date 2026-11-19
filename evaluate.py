@@ -30,9 +30,9 @@ REFUSAL_DIR_PATH = (
 OUTPUT_DIR = "abliteration_evaluation"
 
 # None means evaluate the entire split.
-HARMFUL_LIMIT = None
-HARMLESS_KL_LIMIT = None
-AGIEVAL_LIMIT = None
+HARMFUL_LIMIT = 5 # None
+HARMLESS_KL_LIMIT =5# None
+AGIEVAL_LIMIT = 5 #None
 
 HARMFUL_MAX_NEW_TOKENS = 128
 AGIEVAL_MAX_NEW_TOKENS = 128
