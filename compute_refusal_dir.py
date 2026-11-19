@@ -55,12 +55,29 @@ bar = tqdm(total=max_its)
 
 
 def generate(toks):
-    bar.update(n=1)
-    return model.generate(toks.to(model.device),
-                          use_cache=False,
-                          max_new_tokens=1,
-                          return_dict_in_generate=True,
-                          output_hidden_states=True)
+    # Extract input_ids from Hugging Face tokenizer output
+    if hasattr(toks, "input_ids"):
+        toks = toks.input_ids
+    elif isinstance(toks, dict):
+        toks = toks["input_ids"]
+
+    # Ensure PyTorch tensor
+    if not isinstance(toks, torch.Tensor):
+        toks = torch.tensor(toks)
+
+    toks = toks.to(model.device)
+
+  print("INPUT TYPE:", type(toks))
+  print("INPUT CONTENT:", toks)
+  print("INPUT IDS TYPE:", type(toks["input_ids"]) if hasattr(toks, "keys") and "input_ids" in toks else "No input_ids")
+
+    return model.generate(
+        input_ids=toks,
+        use_cache=False,
+        max_new_tokens=1,
+        return_dict_in_generate=True,
+        output_hidden_states=True
+    )
 
 
 harmful_outputs = [generate(toks) for toks in harmful_toks]
