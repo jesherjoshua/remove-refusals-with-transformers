@@ -79,24 +79,53 @@ def generate(toks):
     )
 
 
-harmful_outputs = [generate(toks) for toks in harmful_toks]
-harmless_outputs = [generate(toks) for toks in harmless_toks]
+# Generate hidden states
+harmful_outputs = []
+harmless_outputs = []
+
+for toks in harmful_toks:
+    harmful_outputs.append(generate(toks))
+    bar.update(1)
+
+for toks in harmless_toks:
+    harmless_outputs.append(generate(toks))
+    bar.update(1)
 
 bar.close()
 
-harmful_hidden = [output.hidden_states[0][layer_idx][:, pos, :] for output in harmful_outputs]
-harmless_hidden = [output.hidden_states[0][layer_idx][:, pos, :] for output in harmless_outputs]
+print("\nGeneration complete!")
 
-print(harmful_hidden)
+# Extract hidden states
+harmful_hidden = [
+    output.hidden_states[0][layer_idx][:, pos, :]
+    for output in harmful_outputs
+]
 
+harmless_hidden = [
+    output.hidden_states[0][layer_idx][:, pos, :]
+    for output in harmless_outputs
+]
+
+print("Harmful hidden states:", len(harmful_hidden))
+print("Harmless hidden states:", len(harmless_hidden))
+print("Hidden state shape:", harmful_hidden[0].shape)
+
+# Calculate means
 harmful_mean = torch.stack(harmful_hidden).mean(dim=0)
 harmless_mean = torch.stack(harmless_hidden).mean(dim=0)
 
-print(harmful_mean)
+print("Harmful mean shape:", harmful_mean.shape)
+print("Harmless mean shape:", harmless_mean.shape)
 
+# Calculate refusal direction
 refusal_dir = harmful_mean - harmless_mean
 refusal_dir = refusal_dir / refusal_dir.norm()
 
-print(refusal_dir)
+print("Refusal direction shape:", refusal_dir.shape)
 
-torch.save(refusal_dir, MODEL_ID.replace("/", "_") + "_refusal_dir.pt")
+# Save
+output_path = MODEL_ID.replace("/", "_") + "_refusal_dir.pt"
+
+torch.save(refusal_dir.cpu(), output_path)
+
+print(f"\nSuccessfully saved refusal direction to: {output_path}")
