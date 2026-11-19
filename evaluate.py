@@ -109,17 +109,8 @@ print("Refusal direction loaded:", refusal_dir.shape)
 # ============================================================
 
 class AblationDecoderLayer(nn.Module):
-
-    def __init__(self, direction):
+    def __init__(self):
         super().__init__()
-
-        self.register_buffer(
-            "direction",
-            direction.clone(),
-            persistent=False,
-        )
-
-        self.attention_type = "full_attention"
 
     def forward(
         self,
@@ -130,38 +121,22 @@ class AblationDecoderLayer(nn.Module):
         output_attentions=False,
         use_cache=False,
         cache_position=None,
-        **kwargs,
+        **kwargs
     ):
+        if not ABLATION_ENABLED:
+            return hidden_states
 
-        if output_attentions:
-            raise NotImplementedError(
-                "This evaluation does not use output_attentions."
-            )
+        direction = refusal_dir.to(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype
+        )
 
-        if ABLATION_ENABLED:
+        # Project hidden states onto the refusal direction
+        projection = (
+            hidden_states * direction
+        ).sum(dim=-1, keepdim=True) * direction
 
-            direction = self.direction.to(
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-
-            projection = torch.matmul(
-                hidden_states,
-                direction,
-            )
-
-            hidden_states = (
-                hidden_states
-                - projection.unsqueeze(-1) * direction
-            )
-
-        outputs = (hidden_states,)
-
-        if use_cache:
-            outputs += (past_key_value,)
-
-        return outputs
-
+        return hidden_states - projection
 
 # ============================================================
 # INSERT ABLATION LAYERS
